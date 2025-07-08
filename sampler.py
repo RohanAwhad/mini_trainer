@@ -231,10 +231,14 @@ class MaxTokensPerRankCollator:
         dummy_sample (dict, optional): A sample used for padding when a rank
             has no real samples assigned in a minibatch.
     """
-    def __init__(self, max_tokens_per_rank: int, rank: int=None, world_size: int=None, dummy_sample=None):
+    def __init__(self, max_tokens_per_rank: int, tp_size: int, rank: int=None, world_size: int=None, dummy_sample=None):
         self.max_tokens_per_rank = max_tokens_per_rank
         self.rank = rank if rank is not None else dist.get_rank()
         self.world_size = world_size if world_size is not None else dist.get_world_size()
+        # TODO: remove this logic from here. we will get the mesh itself, and we can figure this out from that.
+        self.fsdp_size = self.world_size // tp_size
+        self.tp_size = tp_size
+        self.fsdp_group_rank = self.rank // tp_size
         if dummy_sample is None:
             dummy_sample = {'input_ids': torch.tensor([15, 14, 13, 12, 11], dtype=torch.long),
                             'labels': torch.tensor([-100, -100, -100, -100, -100], dtype=torch.long),
@@ -257,7 +261,7 @@ class MaxTokensPerRankCollator:
             print(f"\033[38;5;196mremoved {len(batch) - len(batch_)} samples from batch because they are longer than the max tokens per gpu\033[0m")
         batch_lengths = [sample['len'] for sample in batch]
         batch_num_loss_counted_tokens = sum([sample['num_loss_counted_tokens'] for sample in batch])
-        all_minibatches_indices = batch_lengths_to_minibatches_lpt(batch_lengths, self.max_tokens_per_rank, self.world_size, self.rank)
+        all_minibatches_indices = batch_lengths_to_minibatches_lpt(batch_lengths, self.max_tokens_per_rank, self.fsdp_size, self.fsdp_group_rank)
         
         all_minibatches = []
         for mb_indices in all_minibatches_indices:
@@ -266,7 +270,7 @@ class MaxTokensPerRankCollator:
 
         return all_minibatches
     
-def get_data_loader(**kwargs):
+def get_data_loader(tp_size: int = 1, **kwargs):
     # from ipdb import set_trace; set_trace()
     dataset = JsonlDataset(kwargs['data_path'])
     batch_size = kwargs['batch_size']
@@ -279,6 +283,7 @@ def get_data_loader(**kwargs):
                       batch_size, 
                       sampler=InfiniteSampler(len(dataset), seed=seed),
                       collate_fn=MaxTokensPerRankCollator(max_tokens_per_rank, 
+                                                          tp_size=tp_size,
                                                           rank=rank, 
                                                           world_size=world_size, 
                                                           dummy_sample=dummy_sample),

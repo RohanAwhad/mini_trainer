@@ -163,6 +163,7 @@ def main(
     data_path: str = Option("test.jsonl", help="Path to the training data JSONL file"),
     batch_size: int = Option(1024, help="Initial batch size before dynamic splitting"),
     max_tokens_per_gpu: int = Option(10000, help="Maximum tokens per GPU per minibatch"),
+    tensor_parallel_size: int = Option(1, help="tensor parallelism group size"), 
     learning_rate: float = Option(5e-6, help="Peak learning rate"),
     num_warmup_steps: int = Option(10, help="Number of warmup steps for the LR scheduler"),
     lr_scheduler: str = Option("constant_with_warmup", help="Learning rate scheduler type"),
@@ -210,10 +211,11 @@ def main(
     model = setup_model(model_name_or_path=model_name_or_path,
                         use_liger_kernels=use_liger_kernels,)
     model, optimizer, lr_scheduler = setup_training_components(model,
+                                                               tensor_parallel_size=tensor_parallel_size,
                                                                learning_rate=learning_rate,
                                                                num_warmup_steps=num_warmup_steps,
                                                                lr_scheduler=lr_scheduler)
-    data_loader = get_data_loader(data_path=data_path,
+    data_loader = get_data_loader(tp_size=tensor_parallel_size, data_path=data_path,
                                   batch_size=batch_size,
                                   max_tokens_per_gpu=max_tokens_per_gpu,
                                   seed=seed)
