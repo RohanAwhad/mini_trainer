@@ -221,7 +221,8 @@ def main(
     fsdp_mesh, tp_mesh = world_mesh['fsdp'], world_mesh['tp']
 
     model = setup_model(model_name_or_path=model_name_or_path,
-                        use_liger_kernels=use_liger_kernels,)
+                        use_liger_kernels=use_liger_kernels,
+                        tp_size=tensor_parallel_size)
     model, optimizer, lr_scheduler = setup_training_components(model,
                                                                fsdp_mesh=fsdp_mesh,
                                                                tp_mesh=tp_mesh,

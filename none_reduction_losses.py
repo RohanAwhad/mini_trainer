@@ -31,6 +31,8 @@ def hf_fixed_cross_entropy_none_reduction(
     ignore_index: int = -100,
     **kwargs,
 ) -> torch.Tensor:
-    # torch.distributed.breakpoint()
-    loss = nn.functional.cross_entropy(source, target, ignore_index=ignore_index, reduction='none')
+    from torch.distributed.tensor.parallel import loss_parallel
+    
+    with loss_parallel():
+        loss = nn.functional.cross_entropy(source, target, ignore_index=ignore_index, reduction='none')
     return loss

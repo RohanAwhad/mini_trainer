@@ -13,14 +13,87 @@ from utils import log_rank_0, patch_target_module
 # New simple HF-only activation-checkpointing + FSDP2 wrapper
 # This mirrors TorchTitan: checkpoint each block, then shard each block and the full model.
 def create_tensor_parallel_plan(model) -> dict:
-    """Dynamically create tensor parallel plan based on model architecture."""
-    # TODO: make the plan creation dynamic
+    """Create tensor parallel plan for transformer decoder layers."""
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel, RowwiseParallel, SequenceParallel, PrepareModuleInput
+    )
+    from torch.distributed.tensor import Shard, Replicate
+    
     return {
-        # mlp layers
+        # LayerNorm layers with sequence parallelism
+        "input_layernorm": SequenceParallel(),
+        "post_attention_layernorm": SequenceParallel(),
+        
+        # Attention module preparation 
+        "self_attn": PrepareModuleInput(
+            input_layouts=(Shard(1),),
+            desired_input_layouts=(Replicate(),),
+        ),
+        
+        # Attention projections
+        "self_attn.q_proj": ColwiseParallel(),
+        "self_attn.k_proj": ColwiseParallel(),
+        "self_attn.v_proj": ColwiseParallel(),
+        "self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+        
+        # Attention norms (sequence parallel)
+        "self_attn.q_norm": SequenceParallel(),
+        "self_attn.k_norm": SequenceParallel(),
+        
+        # MLP module preparation
+        "mlp": PrepareModuleInput(
+            input_layouts=(Shard(1),),
+            desired_input_layouts=(Replicate(),),
+        ),
+        
+        # MLP projections
         "mlp.gate_proj": ColwiseParallel(),
         "mlp.up_proj": ColwiseParallel(),
-        "mlp.down_proj": RowwiseParallel(),
+        "mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
     }
+
+
+def parallelize_full_model(model, tp_mesh):
+    """Parallelize the entire model including embeddings and output layers."""
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel, RowwiseParallel, SequenceParallel, parallelize_module
+    )
+    from torch.distributed.tensor import Shard, Replicate
+    
+    # 1. Parallelize decoder layers
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+        layer_tp_plan = create_tensor_parallel_plan(model)
+        
+        for block in layers:
+            parallelize_module(module=block, device_mesh=tp_mesh, parallelize_plan=layer_tp_plan)
+    
+    # 2. Parallelize model-level components
+    model_tp_plan = {}
+    
+    # Embedding layer - row-wise parallel with sequence output
+    if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+        model_tp_plan["model.embed_tokens"] = RowwiseParallel(
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+        )
+    
+    # Final layer norm - sequence parallel
+    if hasattr(model, "model") and hasattr(model.model, "norm"):
+        model_tp_plan["model.norm"] = SequenceParallel()
+    
+    # Output projection - column-wise parallel with DTensor output for loss parallel
+    if hasattr(model, "lm_head"):
+        model_tp_plan["lm_head"] = ColwiseParallel(
+            input_layouts=Shard(1),
+            use_local_output=False,  # Keep DTensor for loss parallel
+        )
+    
+    # Apply model-level parallelization
+    if model_tp_plan:
+        parallelize_module(module=model, device_mesh=tp_mesh, parallelize_plan=model_tp_plan)
+    
+    return model
 
 def wrap_fsdp2(model: torch.nn.Module, fsdp_mesh, tp_mesh) -> torch.nn.Module:
     # Move model to GPU and disable HuggingFace cache
@@ -30,33 +103,33 @@ def wrap_fsdp2(model: torch.nn.Module, fsdp_mesh, tp_mesh) -> torch.nn.Module:
             model.config.use_cache = False
         except Exception:
             pass
-    # 1) Find the HF transformer block container (GPT2: transformer.h, Llama: model.layers)
+    
+    # Find transformer layers
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         layers = model.model.layers
     else:
         raise ValueError("Cannot find transformer block container on model")
-    # 2) Activation checkpoint each block
+    
+    # Activation checkpoint each block
     for idx, block in enumerate(layers):
         layers[idx] = ptd_checkpoint_wrapper(block, preserve_rng_state=False)
 
-    # 3) Create tensor parallel plan and apply it
-    model_tp_plan = create_tensor_parallel_plan(model)
-    for block in layers:
-        parallelize_module(module=block, device_mesh=tp_mesh, parallelize_plan=model_tp_plan)
+    # Apply tensor parallelism to full model
+    model = parallelize_full_model(model, tp_mesh)
 
-
-    # 4) Mixed-precision policy (bf16)
+    # Mixed-precision policy
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, 
         reduce_dtype=torch.bfloat16,
-        output_dtype=torch.bfloat16)
+        output_dtype=torch.bfloat16
+    )
 
-    # 4) FSDP2 wrap each block
+    # FSDP2 wrap each block
     for idx, block in enumerate(layers):
         reshard = idx < len(layers) - 1
         fully_shard(block, mesh=fsdp_mesh, mp_policy=mp_policy, reshard_after_forward=reshard)
 
-    # 5) FSDP2 wrap full model
+    # FSDP2 wrap full model
     fully_shard(model, mesh=fsdp_mesh, mp_policy=mp_policy, reshard_after_forward=True)
     return model
 
@@ -105,6 +178,7 @@ def setup_model(model=None, **kwargs):
 
     if kwargs['use_liger_kernels']:
         '''need to patch the loss function to not reduce, so we can reduce across all GPUs'''
+        if kwargs['tp_size'] >= 1: raise ValueError("Liger kernels are not supported with tensor parallelism")
         from none_reduction_losses import liger_fixed_fused_linear_cross_entropy_none_reduction
         patch_target_module("liger_kernel.transformers.model.loss_utils.fixed_fused_linear_cross_entropy", 
                             liger_fixed_fused_linear_cross_entropy_none_reduction)
@@ -129,6 +203,8 @@ def setup_model(model=None, **kwargs):
         "GemmaForCausalLM",
         "MixtralForCausalLM",
         "GraniteForCausalLM",
+        "Qwen2ForCausalLM",
+        "Qwen3ForCausalLM",
     ]:
         log_rank_0(
             f"\033[38;2;255;255;0mWarning: Model class name: {model.__class__.__name__} is not in the list of supported models.\033[0m",
@@ -155,8 +231,8 @@ def setup_training_components(model, fsdp_mesh, tp_mesh, **kwargs):
         betas=(0.9, 0.95),
         weight_decay=0.0,
         # TODO: fix this to be dynamic, or handle this gracefully so that user doesn't have to worry about it, and still get the optimized version.
-        foreach=False,
-        fused=False,
+        foreach=False if tp_mesh.size(0) > 1 else None,
+        fused=False if tp_mesh.size(0) > 1 else None,
     )
     lr_scheduler = get_scheduler(
         name=kwargs['lr_scheduler'],
