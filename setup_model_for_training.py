@@ -117,11 +117,8 @@ def setup_model(model=None, **kwargs):
         from none_reduction_losses import hf_fixed_cross_entropy_none_reduction
         patch_target_module("transformers.loss.loss_utils.fixed_cross_entropy", 
                             hf_fixed_cross_entropy_none_reduction)
-        from transformers import AutoModelForCausalLM, AutoConfig
-        config = AutoConfig.from_pretrained(base_model_args['pretrained_model_name_or_path'])
-        print(config)
-        exit(0)
-        model = AutoModelForCausalLM.from_pretrained(**base_model_args, config=config)
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(**base_model_args)
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(kwargs['model_name_or_path'])
