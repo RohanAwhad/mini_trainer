@@ -224,20 +224,17 @@ class MaxTokensPerRankCollator:
     Args:
         max_tokens_per_rank (int): Maximum number of tokens allowed per rank
             in a single processed minibatch.
+        fsdp_size (int): Number of FSDP ranks (data parallel size).
+        tp_size (int): Number of TP ranks (tensor parallel size).
         rank (int, optional): The rank of the current process. If None, attempts
-            to get it from `torch.distributed`.
-        world_size (int, optional): Total number of ranks. If None, attempts
             to get it from `torch.distributed`.
         dummy_sample (dict, optional): A sample used for padding when a rank
             has no real samples assigned in a minibatch.
     """
-    def __init__(self, max_tokens_per_rank: int, tp_size: int, rank: int=None, world_size: int=None, dummy_sample=None):
+    def __init__(self, max_tokens_per_rank: int, fsdp_size: int, tp_size: int, rank: int=None, dummy_sample=None):
         self.max_tokens_per_rank = max_tokens_per_rank
         self.rank = rank if rank is not None else dist.get_rank()
-        self.world_size = world_size if world_size is not None else dist.get_world_size()
-        # TODO: remove this logic from here. we will get the mesh itself, and we can figure this out from that.
-        self.fsdp_size = self.world_size // tp_size
-        self.tp_size = tp_size
+        self.fsdp_size = fsdp_size
         self.fsdp_group_rank = self.rank // tp_size
         if dummy_sample is None:
             dummy_sample = {'input_ids': torch.tensor([15, 14, 13, 12, 11], dtype=torch.long),
@@ -245,6 +242,7 @@ class MaxTokensPerRankCollator:
                             'len': 5,
                             'num_loss_counted_tokens': 0}
         self.dummy_sample = dummy_sample
+
 
     def __call__(self, batch: list[dict]):
         """Processes a batch of samples into a list of packed minibatches for the current rank.
@@ -270,24 +268,23 @@ class MaxTokensPerRankCollator:
 
         return all_minibatches
     
-def get_data_loader(tp_size: int = 1, **kwargs):
-    # from ipdb import set_trace; set_trace()
+def get_data_loader(fsdp_size: int, tp_size: int = 1, **kwargs):
     dataset = JsonlDataset(kwargs['data_path'])
     batch_size = kwargs['batch_size']
     max_tokens_per_rank = kwargs['max_tokens_per_gpu']
     seed = kwargs['seed']
     rank = kwargs.get('rank', None)
-    world_size = kwargs.get('world_size', None)
     dummy_sample = kwargs.get('dummy_sample', None)
     return DataLoader(dataset, 
                       batch_size, 
                       sampler=InfiniteSampler(len(dataset), seed=seed),
                       collate_fn=MaxTokensPerRankCollator(max_tokens_per_rank, 
+                                                          fsdp_size=fsdp_size,
                                                           tp_size=tp_size,
                                                           rank=rank, 
-                                                          world_size=world_size, 
                                                           dummy_sample=dummy_sample),
                       num_workers=4)
+
 
 if __name__ == "__main__":
     data_loader = get_data_loader(data_path="test.jsonl",

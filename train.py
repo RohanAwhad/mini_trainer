@@ -16,7 +16,7 @@ from utils import init_distributed_environment, log_rank_0, setup_logger
 
 app = Typer(
     pretty_exceptions_show_locals=False,  # Hide local variables in tracebacks
-    pretty_exceptions_short=True   
+    pretty_exceptions_short=True
 )
 
 def take_gradient_step(model, optimizer, lr_scheduler):
@@ -41,11 +41,11 @@ def save_model(fsdp_model, samples_seen, output_dir, model_name_or_path):
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
     state_dict = get_model_state_dict(fsdp_model, options=StateDictOptions(full_state_dict=True))
     state_dict = {k:v.to(torch.bfloat16) for k,v in state_dict.items()}
-    
+
     if rank == 0:
         pattern = "model{suffix}.safetensors"
         index_name = "model.safetensors.index.json"
-        
+
         # Shard splitting
         split = split_torch_state_dict_into_shards(
             state_dict, filename_pattern=pattern, max_shard_size="5GB",
@@ -55,7 +55,7 @@ def save_model(fsdp_model, samples_seen, output_dir, model_name_or_path):
             shard = {k: state_dict[k] for k in tensors}
             path = os.path.join(save_directory, filename)
             save_file(shard, path)
-            
+
         # Save index if sharded
         if split.is_sharded:
             index = {"metadata": split.metadata, "weight_map": split.tensor_to_filename}
@@ -69,11 +69,9 @@ def save_model(fsdp_model, samples_seen, output_dir, model_name_or_path):
         log_rank_0(f"\033[1;38;2;0;255;255mSaved model at\033[0m {samples_seen} samples in {time.time() - start:.2f} seconds")
     torch.distributed.barrier()
 
-def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_per_checkpoint, model_name_or_path, tp_size):
+def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_per_checkpoint, model_name_or_path, fsdp_size, tp_size):
     model.train()
     metric_logger = AsyncStructuredLogger(output_dir + f"/training_metrics_{os.environ.get('RANK')}.jsonl")
-    world_size = int(os.environ["WORLD_SIZE"])
-    fsdp_size = world_size // tp_size  # TODO: again duplicated logic. get the fsdp_size from main
     is_main_process = os.environ.get("RANK") == "0"
 
     batch_totals = BatchMetrics()
@@ -81,7 +79,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
     total_samples_accumulated = 0
     last_saved_samples = 0
     device = next(model.parameters()).device
-    
+
     data_loader = iter(data_loader)
     for batch in data_loader:
         batch_start_time = time.time()
@@ -96,7 +94,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
             mb = {k: v.to(device) for k, v in mb.items()}
             # torch.distributed.breakpoint()
             output = model(**mb)
-            loss = output.loss.float().sum() 
+            loss = output.loss.float().sum()
             loss_metrics = loss.detach().item()
             '''multiply by fsdp_size to account for the fact that fsdp takes the mean of the gradients across the fsdp_size'''
             '''the loss is a sum of all cross entropy losses for all tokens in the batch, we divide by batch_num_loss_counted_tokens to get the average loss per token'''
@@ -116,7 +114,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
         step += 1
         #sum the metrics from all processes
         batch_totals.reduce_batch_metrics(tp_size, device)
-        
+
         #use accumulated metrics to take a gradient step and logging
         bm = batch_totals.totals
         total_samples_accumulated += bm['num_samples']
@@ -138,14 +136,14 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
                     "avg_time_per_minibatch": bm['time_per_minibatch']/(grad_accum+1)/fsdp_size,
                     "time_per_batch": batch_time,
                     "tokens_per_second": bm['num_total_tokens']/batch_time,
-                    "total_samples_accumulated": total_samples_accumulated, 
+                    "total_samples_accumulated": total_samples_accumulated,
                     "samples_per_second": bm['num_samples']/batch_time,
                     "peak_memory_usage_GB": float(torch.cuda.max_memory_allocated() / 1e9),
                 }
             metric_logger.log_sync(
                 batch_metrics
             )
-        
+
         torch.distributed.barrier()
         if total_samples_accumulated - last_saved_samples >= min_samples_per_checkpoint:
             save_model(model, total_samples_accumulated, output_dir, model_name_or_path)
@@ -164,7 +162,7 @@ def main(
     data_path: str = Option("test.jsonl", help="Path to the training data JSONL file"),
     batch_size: int = Option(1024, help="Initial batch size before dynamic splitting"),
     max_tokens_per_gpu: int = Option(10000, help="Maximum tokens per GPU per minibatch"),
-    tensor_parallel_size: int = Option(1, help="tensor parallelism group size"), 
+    tensor_parallel_size: int = Option(1, help="tensor parallelism group size"),
     learning_rate: float = Option(5e-6, help="Peak learning rate"),
     num_warmup_steps: int = Option(10, help="Number of warmup steps for the LR scheduler"),
     lr_scheduler: str = Option("constant_with_warmup", help="Learning rate scheduler type"),
@@ -172,8 +170,8 @@ def main(
     use_liger_kernels: bool = Option(False, help="Whether to use Liger kernels"),
     output_dir: str = Option(..., help="Directory to save checkpoints and logs (required)"),
     logging_level: LogLevelEnum = Option(
-        LogLevelEnum.INFO, 
-        help="Logging level", 
+        LogLevelEnum.INFO,
+        help="Logging level",
         case_sensitive=False
     ),
     min_samples_per_checkpoint: int = Option(..., help="Minimum number of samples processed before saving a checkpoint (required)"),
@@ -181,7 +179,7 @@ def main(
     init_distributed_environment()
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     # Log parameters only on rank 0
     rank = int(os.environ.get("RANK", 0))
     if rank == 0:
@@ -210,26 +208,44 @@ def main(
         print(f"Training parameters saved to {params_path}")
 
     setup_logger(level=logging_level.value)
+
+    # Create device mesh for distributed training
+    from torch.distributed.device_mesh import init_device_mesh
+    import torch.distributed as dist
+    world_size = dist.get_world_size()
+    assert tensor_parallel_size >= 1 and tensor_parallel_size <= 8, f"expected tensor_parallel_size to be between [1, 8], but got '{tensor_parallel_size}'"
+    assert world_size % tensor_parallel_size == 0, f"expected world_size to be divisible by tensor parallel size, but got '{world_size} % {tensor_parallel_size} == {world_size % tensor_parallel_size}'"
+
+    fsdp_size = world_size // tensor_parallel_size
+    world_mesh = init_device_mesh("cuda", (fsdp_size, tensor_parallel_size), mesh_dim_names=("fsdp", "tp"))
+    fsdp_mesh, tp_mesh = world_mesh['fsdp'], world_mesh['tp']
+
     model = setup_model(model_name_or_path=model_name_or_path,
                         use_liger_kernels=use_liger_kernels,)
     model, optimizer, lr_scheduler = setup_training_components(model,
-                                                               tensor_parallel_size=tensor_parallel_size,
+                                                               fsdp_mesh=fsdp_mesh,
+                                                               tp_mesh=tp_mesh,
                                                                learning_rate=learning_rate,
                                                                num_warmup_steps=num_warmup_steps,
                                                                lr_scheduler=lr_scheduler)
-    data_loader = get_data_loader(tp_size=tensor_parallel_size, data_path=data_path,
+    data_loader = get_data_loader(fsdp_size=fsdp_size,
+                                  tp_size=tensor_parallel_size,
+                                  data_path=data_path,
                                   batch_size=batch_size,
                                   max_tokens_per_gpu=max_tokens_per_gpu,
                                   seed=seed)
-    
-    train(model, 
-          optimizer, 
-          lr_scheduler, 
-          data_loader, 
-          output_dir, 
+
+    train(model,
+          optimizer,
+          lr_scheduler,
+          data_loader,
+          output_dir,
           min_samples_per_checkpoint,
-          model_name_or_path, tp_size=tensor_parallel_size)
-    
+          model_name_or_path,
+          fsdp_size,
+          tensor_parallel_size)
+
+
 if __name__ == "__main__":
     app()
 

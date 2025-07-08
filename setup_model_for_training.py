@@ -12,7 +12,17 @@ from utils import log_rank_0, patch_target_module
 
 # New simple HF-only activation-checkpointing + FSDP2 wrapper
 # This mirrors TorchTitan: checkpoint each block, then shard each block and the full model.
-def wrap_fsdp2(model: torch.nn.Module, tensor_parallel_size: int) -> torch.nn.Module:
+def create_tensor_parallel_plan(model) -> dict:
+    """Dynamically create tensor parallel plan based on model architecture."""
+    # TODO: make the plan creation dynamic
+    return {
+        # mlp layers
+        "mlp.gate_proj": ColwiseParallel(),
+        "mlp.up_proj": ColwiseParallel(),
+        "mlp.down_proj": RowwiseParallel(),
+    }
+
+def wrap_fsdp2(model: torch.nn.Module, fsdp_mesh, tp_mesh) -> torch.nn.Module:
     # Move model to GPU and disable HuggingFace cache
     model = model.to(torch.device("cuda"))
     if hasattr(model, 'config'):
@@ -29,24 +39,11 @@ def wrap_fsdp2(model: torch.nn.Module, tensor_parallel_size: int) -> torch.nn.Mo
     for idx, block in enumerate(layers):
         layers[idx] = ptd_checkpoint_wrapper(block, preserve_rng_state=False)
 
-    # 3) Build a 2D device mesh over all ranks
-    # TODO: pull device mesh creation into train.main(), because dataloader needs this
-    world_size = dist.get_world_size()
-    assert tensor_parallel_size >= 1 and tensor_parallel_size <= 8, f"expected tensor_parallel_size to be between [1, 8], but got '{tensor_parallel_size}'"
-    assert world_size % tensor_parallel_size == 0, f"expected world_size to be divisible by tensor parallel size, but got '{world_size} % {tensor_parallel_size} == {world_size % tensor_parallel_size}'"
-    world_mesh = init_device_mesh("cuda", (world_size // tensor_parallel_size, tensor_parallel_size), mesh_dim_names=("fsdp", "tp"))
-    fsdp_mesh, tp_mesh = world_mesh['fsdp'], world_mesh['tp']
-
-    # create tensor parallel plan and apply it
-    # TODO: make the plan creation dynamic
-    model_tp_plan = {
-        # mlp layers
-        "mlp.gate_proj": ColwiseParallel(),
-        "mlp.up_proj": ColwiseParallel(),
-        "mlp.down_proj": RowwiseParallel(),
-    }
+    # 3) Create tensor parallel plan and apply it
+    model_tp_plan = create_tensor_parallel_plan(model)
     for block in layers:
         parallelize_module(module=block, device_mesh=tp_mesh, parallelize_plan=model_tp_plan)
+
 
     # 4) Mixed-precision policy (bf16)
     mp_policy = MixedPrecisionPolicy(
@@ -145,12 +142,12 @@ def setup_model(model=None, **kwargs):
     # torch.compile(model)
     return model
 
-def setup_training_components(model, tensor_parallel_size, **kwargs):
+def setup_training_components(model, fsdp_mesh, tp_mesh, **kwargs):
     from transformers import get_scheduler
     
     # Using FSDP2 wrapper
     log_rank_0("Using FSDP2 wrapper")
-    model = wrap_fsdp2(model, tensor_parallel_size)
+    model = wrap_fsdp2(model, fsdp_mesh, tp_mesh)
     
     optimizer = torch.optim.AdamW(
         model.parameters(),
