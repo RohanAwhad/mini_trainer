@@ -69,10 +69,11 @@ def save_model(fsdp_model, samples_seen, output_dir, model_name_or_path):
         log_rank_0(f"\033[1;38;2;0;255;255mSaved model at\033[0m {samples_seen} samples in {time.time() - start:.2f} seconds")
     torch.distributed.barrier()
 
-def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_per_checkpoint, model_name_or_path):
+def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_per_checkpoint, model_name_or_path, tp_size):
     model.train()
     metric_logger = AsyncStructuredLogger(output_dir + f"/training_metrics_{os.environ.get('RANK')}.jsonl")
     world_size = int(os.environ["WORLD_SIZE"])
+    fsdp_size = world_size // tp_size  # TODO: again duplicated logic. get the fsdp_size from main
     is_main_process = os.environ.get("RANK") == "0"
 
     batch_totals = BatchMetrics()
@@ -97,9 +98,9 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
             output = model(**mb)
             loss = output.loss.float().sum() 
             loss_metrics = loss.detach().item()
-            '''multiply by world_size to account for the fact that fsdp takes the mean of the gradients across the world_size'''
+            '''multiply by fsdp_size to account for the fact that fsdp takes the mean of the gradients across the fsdp_size'''
             '''the loss is a sum of all cross entropy losses for all tokens in the batch, we divide by batch_num_loss_counted_tokens to get the average loss per token'''
-            loss = loss * world_size / batch_num_loss_counted_tokens
+            loss = loss * fsdp_size / batch_num_loss_counted_tokens
 
             loss.backward()
             torch.cuda.empty_cache()
@@ -109,7 +110,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
                 num_total_tokens=mb['input_ids'].shape[1],
                 num_samples=mb_num_samples,
                 loss=loss_metrics,
-                loss_backward=loss.detach().item()/world_size,
+                loss_backward=loss.detach().item()/fsdp_size,
                 time_per_minibatch=time.time() - mb_start_time,
             )
         step += 1
@@ -134,7 +135,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
                     "batch_num_loss_counted_tokens": batch_num_loss_counted_tokens,
                     "num_total_tokens": bm['num_total_tokens'],
                     "grad_accum": grad_accum+1,
-                    "avg_time_per_minibatch": bm['time_per_minibatch']/(grad_accum+1)/world_size,
+                    "avg_time_per_minibatch": bm['time_per_minibatch']/(grad_accum+1)/fsdp_size,
                     "time_per_batch": batch_time,
                     "tokens_per_second": bm['num_total_tokens']/batch_time,
                     "total_samples_accumulated": total_samples_accumulated, 
@@ -198,7 +199,8 @@ def main(
             "logging_level": logging_level.value,
             "min_samples_per_checkpoint": min_samples_per_checkpoint,
             "RANK": rank, # Include rank itself, though it will be 0 here
-            "WORLD_SIZE": int(os.environ.get("WORLD_SIZE", 1))
+            "WORLD_SIZE": int(os.environ.get("WORLD_SIZE", 1)),
+            "tensor_parallel_size": tensor_parallel_size,
         }
         params_path = output_path / f"training_params.json"
         with open(params_path, 'w') as f:
@@ -226,7 +228,7 @@ def main(
           data_loader, 
           output_dir, 
           min_samples_per_checkpoint,
-          model_name_or_path)
+          model_name_or_path, tp_size=tensor_parallel_size)
     
 if __name__ == "__main__":
     app()
