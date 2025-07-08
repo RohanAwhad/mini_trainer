@@ -115,7 +115,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
             )
         step += 1
         #sum the metrics from all processes
-        batch_totals.reduce_batch_metrics(device)
+        batch_totals.reduce_batch_metrics(tp_size, device)
         
         #use accumulated metrics to take a gradient step and logging
         bm = batch_totals.totals

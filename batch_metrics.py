@@ -16,13 +16,13 @@ class BatchMetrics:
         for key, value in kwargs.items():
             self.minibatch_metrics[key] += value
 
-    def reduce_batch_metrics(self, device):
+    def reduce_batch_metrics(self, tp_size, device):
         """
         Reduce the minibatch metrics across all processes.
         """
         # Create a tensor from the minibatch_metrics values in the order of keys
         keys = list(self.minibatch_metrics.keys())
-        tensor = torch.tensor([float(self.minibatch_metrics[k]) for k in keys], device=device)
+        tensor = torch.tensor([float(self.minibatch_metrics[k]) / tp_size for k in keys], device=device)
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
         # Store reduced values for this batch
         self.totals = {key: value for key, value in zip(keys, tensor.tolist())}
