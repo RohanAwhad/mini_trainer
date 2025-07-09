@@ -8,6 +8,7 @@ from typer import Typer, Option
 
 from async_structured_logger import AsyncStructuredLogger
 import torch
+from torch.distributed.tensor.parallel import loss_parallel
 
 from batch_metrics import BatchMetrics
 from sampler import get_data_loader
@@ -96,14 +97,19 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
             mb = {k: v.to(device) for k, v in mb.items()}
             # torch.distributed.breakpoint()
             output = model(**mb)
-            loss = output.loss.float().sum()
-            loss_metrics = loss.detach().item()
-            '''multiply by fsdp_size to account for the fact that fsdp takes the mean of the gradients across the fsdp_size'''
-            '''the loss is a sum of all cross entropy losses for all tokens in the batch, we divide by batch_num_loss_counted_tokens to get the average loss per token'''
-            loss = loss * fsdp_size / batch_num_loss_counted_tokens
-
-            # TODO: fix this. it is not going to work as we are using loss_parallel
-            loss.backward()
+            with loss_parallel():
+                loss = output.loss.float().sum()
+                loss_metrics = loss.detach().item()
+                loss = loss * fsdp_size / batch_num_loss_counted_tokens
+                loss.backward()  # ✅ inside context
+            # loss = output.loss.float().sum()
+            # loss_metrics = loss.detach().item()
+            # '''multiply by fsdp_size to account for the fact that fsdp takes the mean of the gradients across the fsdp_size'''
+            # '''the loss is a sum of all cross entropy losses for all tokens in the batch, we divide by batch_num_loss_counted_tokens to get the average loss per token'''
+            # loss = loss * fsdp_size / batch_num_loss_counted_tokens
+            #
+            # # TODO: fix this. it is not going to work as we are using loss_parallel
+            # loss.backward()
             torch.cuda.empty_cache()
 
             batch_totals.accumulate_minibatch_metrics(

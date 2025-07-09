@@ -15,12 +15,11 @@ from utils import log_rank_0, patch_target_module
 
 # New simple HF-only activation-checkpointing + FSDP2 wrapper
 # This mirrors TorchTitan: checkpoint each block, then shard each block and the full model.
-def create_tensor_parallel_plan(model) -> dict:
+def create_tensor_parallel_plan() -> dict:
     """Create tensor parallel plan for transformer decoder layers with sequence parallelism."""
     return {
-        # Sequence parallel on norm layers - outputs Shard(1)
+        # Sequence parallel on pre-attention norm layers - outputs Shard(1)
         "input_layernorm": SequenceParallel(),
-        "post_attention_layernorm": SequenceParallel(),
         
         # PrepareModuleInput: convert Shard(1) -> Replicate() for attention
         # Use input_kwarg_layouts for keyword arguments (HuggingFace models use kwargs)
@@ -28,23 +27,20 @@ def create_tensor_parallel_plan(model) -> dict:
             input_kwarg_layouts={"hidden_states": Shard(1)},
             desired_input_kwarg_layouts={"hidden_states": Replicate()},
         ),
-        
         # Attention projections
         "self_attn.q_proj": ColwiseParallel(),
         "self_attn.k_proj": ColwiseParallel(),
         "self_attn.v_proj": ColwiseParallel(),
         "self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),  # output Shard(1)
-        
-        # Attention norms (sequence parallel)
-        "self_attn.q_norm": SequenceParallel(),
-        "self_attn.k_norm": SequenceParallel(),
-        
+
+        # sequence parallel on norm layer post attention
+        "post_attention_layernorm": SequenceParallel(),
+
         # PrepareModuleInput: convert Shard(1) -> Replicate() for MLP
         "mlp": PrepareModuleInput(
             input_layouts=(Shard(1),),
             desired_input_layouts=(Replicate(),),
         ),
-        
         # MLP projections
         "mlp.gate_proj": ColwiseParallel(),
         "mlp.up_proj": ColwiseParallel(),
@@ -54,39 +50,24 @@ def create_tensor_parallel_plan(model) -> dict:
 
 def parallelize_full_model(model, tp_mesh):
     """Parallelize the entire model including embeddings and output layers."""
+    # raise warning if model is not one of Qwen3, Qwen2 and Llama
+    if model.__class__.__name__ not in ["Qwen3ForCausalLM", "Qwen2ForCausalLM", "LlamaForCausalLM"]:
+        log_rank_0(
+            f"\033[38;2;255;255;0mWarning: Model class name: {model.__class__.__name__} is not in the list of supported models for tensor parallel.\033[0m",
+            to_print=True,
+        )
+
     # 1. Parallelize decoder layers
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers
-        layer_tp_plan = create_tensor_parallel_plan(model)
-        
-        for block in layers:
-            parallelize_module(module=block, device_mesh=tp_mesh, parallelize_plan=layer_tp_plan)
+    layers = model.model.layers
+    layer_tp_plan = create_tensor_parallel_plan()
+    for block in layers: parallelize_module(module=block, device_mesh=tp_mesh, parallelize_plan=layer_tp_plan)
     
     # 2. Parallelize model-level components
     model_tp_plan = {}
-    
-    # Embedding layer - row-wise parallel with sequence output for SP
-    if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-        model_tp_plan["model.embed_tokens"] = RowwiseParallel(
-            input_layouts=Replicate(),
-            output_layouts=Shard(1),  # output sequence-sharded for SP
-        )
-    
-    # Final layer norm - sequence parallel
-    if hasattr(model, "model") and hasattr(model.model, "norm"):
-        model_tp_plan["model.norm"] = SequenceParallel()
-    
-    # Output projection - column-wise parallel with DTensor output for loss parallel
-    if hasattr(model, "lm_head"):
-        model_tp_plan["lm_head"] = ColwiseParallel(
-            input_layouts=Shard(1),  # input sequence-sharded from SP
-            use_local_output=False,  # Keep DTensor for loss parallel
-        )
-    
-    # Apply model-level parallelization
-    if model_tp_plan:
-        parallelize_module(module=model, device_mesh=tp_mesh, parallelize_plan=model_tp_plan)
-    
+    model_tp_plan["model.embed_tokens"] = RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1))
+    model_tp_plan["model.norm"] = SequenceParallel()
+    model_tp_plan["lm_head"] = ColwiseParallel(input_layouts=Shard(1), use_local_output=False)
+    parallelize_module(module=model, device_mesh=tp_mesh, parallelize_plan=model_tp_plan)
     return model
 
 def wrap_fsdp2(model: torch.nn.Module, fsdp_mesh, tp_mesh) -> torch.nn.Module:
@@ -103,13 +84,13 @@ def wrap_fsdp2(model: torch.nn.Module, fsdp_mesh, tp_mesh) -> torch.nn.Module:
         layers = model.model.layers
     else:
         raise ValueError("Cannot find transformer block container on model")
+
+    # Apply tensor parallelism to full model
+    model = parallelize_full_model(model, tp_mesh)
     
     # Activation checkpoint each block
     for idx, block in enumerate(layers):
         layers[idx] = ptd_checkpoint_wrapper(block, preserve_rng_state=False)
-
-    # Apply tensor parallelism to full model
-    model = parallelize_full_model(model, tp_mesh)
 
     # Mixed-precision policy
     mp_policy = MixedPrecisionPolicy(
@@ -176,7 +157,7 @@ def setup_model(model=None, **kwargs):
 
     if kwargs['use_liger_kernels']:
         '''need to patch the loss function to not reduce, so we can reduce across all GPUs'''
-        if kwargs['tp_size'] >= 1: raise ValueError("Liger kernels are not supported with tensor parallelism")
+        if kwargs['tp_size'] > 1: raise ValueError("Liger kernels are not supported with tensor parallelism")
         from none_reduction_losses import liger_fixed_fused_linear_cross_entropy_none_reduction
         patch_target_module("liger_kernel.transformers.model.loss_utils.fixed_fused_linear_cross_entropy", 
                             liger_fixed_fused_linear_cross_entropy_none_reduction)
