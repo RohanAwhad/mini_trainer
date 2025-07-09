@@ -141,7 +141,14 @@ class InfiniteSampler(Sampler):
     def __len__(self):
         return self.len_data
     
-def mb_collate_fn(minibatch, batch_num_loss_counted_tokens):
+def pad_to_multiple(x, multiple, value=0):
+    """Pad tensor to make its last dimension a multiple of `multiple`."""
+    pad = (-x.size(-1)) % multiple
+    if pad:
+        x = torch.nn.functional.pad(x, (0, pad), value=value)
+    return x
+
+def mb_collate_fn(minibatch, batch_num_loss_counted_tokens, tp_size=1):
     """Collates a list of samples into a single packed batch for Flash Attention.
 
     This function takes a 'minibatch' (list of pre-fetched dataset samples)
@@ -162,6 +169,7 @@ def mb_collate_fn(minibatch, batch_num_loss_counted_tokens):
     Args:
         minibatch: A list of dictionaries, where each dictionary represents a
                    sample and contains at least 'input_ids' and 'labels'.
+        tp_size: Tensor parallel size for padding requirements.
 
     Returns:
         A dictionary containing the collated batch:
@@ -197,11 +205,21 @@ def mb_collate_fn(minibatch, batch_num_loss_counted_tokens):
     #     f"\033[96m total length: {total_len} "
     #     f"num_loss_counted_tokens: {num_loss_counted_tokens}\033[0m"
     # )
+    # Create tensors
+    input_ids_tensor = torch.tensor([input_ids], dtype=torch.long)
+    labels_tensor = torch.tensor([labels], dtype=torch.long)
+    position_ids_tensor = torch.tensor([position_ids], dtype=torch.long)
+    
+    # Pad for sequence parallelism - sequence length must be divisible by tp_size
+    if tp_size > 1:
+        input_ids_tensor = pad_to_multiple(input_ids_tensor, tp_size, value=0)
+        labels_tensor = pad_to_multiple(labels_tensor, tp_size, value=-100)
+        position_ids_tensor = pad_to_multiple(position_ids_tensor, tp_size, value=0)
 
     return {
-        "input_ids": torch.tensor([input_ids], dtype=torch.long),
-        "labels": torch.tensor([labels], dtype=torch.long),
-        "position_ids": torch.tensor([position_ids], dtype=torch.long),
+        "input_ids": input_ids_tensor,
+        "labels": labels_tensor,
+        "position_ids": position_ids_tensor,
         "num_loss_counted_tokens": num_loss_counted_tokens,
         "num_samples": num_samples,
         "batch_num_loss_counted_tokens": batch_num_loss_counted_tokens,
@@ -235,6 +253,7 @@ class MaxTokensPerRankCollator:
         self.max_tokens_per_rank = max_tokens_per_rank
         self.rank = rank if rank is not None else dist.get_rank()
         self.fsdp_size = fsdp_size
+        self.tp_size = tp_size
         self.fsdp_group_rank = self.rank // tp_size
         if dummy_sample is None:
             dummy_sample = {'input_ids': torch.tensor([15, 14, 13, 12, 11], dtype=torch.long),
@@ -264,7 +283,7 @@ class MaxTokensPerRankCollator:
         all_minibatches = []
         for mb_indices in all_minibatches_indices:
             mb = [batch[i] if i != -1 else self.dummy_sample for i in mb_indices]
-            all_minibatches.append(mb_collate_fn(mb, batch_num_loss_counted_tokens))
+            all_minibatches.append(mb_collate_fn(mb, batch_num_loss_counted_tokens, self.tp_size))
 
         return all_minibatches
     

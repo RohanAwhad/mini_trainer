@@ -21,7 +21,9 @@ app = Typer(
 
 def take_gradient_step(model, optimizer, lr_scheduler):
     """Scales gradients, applies clipping, and takes an optimization step."""
+    from setup_model_for_training import _to_local
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    grad_norm = _to_local(grad_norm)  # Convert DTensor to local if needed
     optimizer.step()
     lr_scheduler.step()
     optimizer.zero_grad()
@@ -100,6 +102,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
             '''the loss is a sum of all cross entropy losses for all tokens in the batch, we divide by batch_num_loss_counted_tokens to get the average loss per token'''
             loss = loss * fsdp_size / batch_num_loss_counted_tokens
 
+            # TODO: fix this. it is not going to work as we are using loss_parallel
             loss.backward()
             torch.cuda.empty_cache()
 
@@ -122,10 +125,11 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
 
         if is_main_process:
             batch_time = time.time() - batch_start_time
+            from setup_model_for_training import _to_local
             batch_metrics = {
                     "step": step,
                     "lr": lr_scheduler.get_last_lr()[0],
-                    "grad_norm": grad_norm.item(),
+                    "grad_norm": _to_local(grad_norm).item(),
                     "loss": bm['loss']/batch_num_loss_counted_tokens,
                     "avg_loss_backward": bm['loss_backward']/(grad_accum+1),
                     "num_samples": bm['num_samples'],
@@ -140,6 +144,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
                     "samples_per_second": bm['num_samples']/batch_time,
                     "peak_memory_usage_GB": float(torch.cuda.max_memory_allocated() / 1e9),
                 }
+
             metric_logger.log_sync(
                 batch_metrics
             )

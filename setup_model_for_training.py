@@ -6,41 +6,40 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel, RowwiseParallel, SequenceParallel, PrepareModuleInput, parallelize_module
+)
+from torch.distributed.tensor import Shard, Replicate, DTensor
 
 from utils import log_rank_0, patch_target_module
 
 # New simple HF-only activation-checkpointing + FSDP2 wrapper
 # This mirrors TorchTitan: checkpoint each block, then shard each block and the full model.
 def create_tensor_parallel_plan(model) -> dict:
-    """Create tensor parallel plan for transformer decoder layers."""
-    from torch.distributed.tensor.parallel import (
-        ColwiseParallel, RowwiseParallel, SequenceParallel, PrepareModuleInput
-    )
-    from torch.distributed.tensor import Shard, Replicate
-    
+    """Create tensor parallel plan for transformer decoder layers with sequence parallelism."""
     return {
-        # LayerNorm layers with sequence parallelism
+        # Sequence parallel on norm layers - outputs Shard(1)
         "input_layernorm": SequenceParallel(),
         "post_attention_layernorm": SequenceParallel(),
         
-        # Attention module preparation 
+        # PrepareModuleInput: convert Shard(1) -> Replicate() for attention
+        # Use input_kwarg_layouts for keyword arguments (HuggingFace models use kwargs)
         "self_attn": PrepareModuleInput(
-            input_layouts=(Shard(1),),
-            desired_input_layouts=(Replicate(),),
+            input_kwarg_layouts={"hidden_states": Shard(1)},
+            desired_input_kwarg_layouts={"hidden_states": Replicate()},
         ),
         
         # Attention projections
         "self_attn.q_proj": ColwiseParallel(),
         "self_attn.k_proj": ColwiseParallel(),
         "self_attn.v_proj": ColwiseParallel(),
-        "self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),  # output Shard(1)
         
         # Attention norms (sequence parallel)
         "self_attn.q_norm": SequenceParallel(),
         "self_attn.k_norm": SequenceParallel(),
         
-        # MLP module preparation
+        # PrepareModuleInput: convert Shard(1) -> Replicate() for MLP
         "mlp": PrepareModuleInput(
             input_layouts=(Shard(1),),
             desired_input_layouts=(Replicate(),),
@@ -49,17 +48,12 @@ def create_tensor_parallel_plan(model) -> dict:
         # MLP projections
         "mlp.gate_proj": ColwiseParallel(),
         "mlp.up_proj": ColwiseParallel(),
-        "mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),  # output Shard(1)
     }
 
 
 def parallelize_full_model(model, tp_mesh):
     """Parallelize the entire model including embeddings and output layers."""
-    from torch.distributed.tensor.parallel import (
-        ColwiseParallel, RowwiseParallel, SequenceParallel, parallelize_module
-    )
-    from torch.distributed.tensor import Shard, Replicate
-    
     # 1. Parallelize decoder layers
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         layers = model.model.layers
@@ -71,11 +65,11 @@ def parallelize_full_model(model, tp_mesh):
     # 2. Parallelize model-level components
     model_tp_plan = {}
     
-    # Embedding layer - row-wise parallel with sequence output
+    # Embedding layer - row-wise parallel with sequence output for SP
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         model_tp_plan["model.embed_tokens"] = RowwiseParallel(
             input_layouts=Replicate(),
-            output_layouts=Shard(1),
+            output_layouts=Shard(1),  # output sequence-sharded for SP
         )
     
     # Final layer norm - sequence parallel
@@ -85,7 +79,7 @@ def parallelize_full_model(model, tp_mesh):
     # Output projection - column-wise parallel with DTensor output for loss parallel
     if hasattr(model, "lm_head"):
         model_tp_plan["lm_head"] = ColwiseParallel(
-            input_layouts=Shard(1),
+            input_layouts=Shard(1),  # input sequence-sharded from SP
             use_local_output=False,  # Keep DTensor for loss parallel
         )
     
@@ -168,6 +162,10 @@ def align_model_and_tokenizer(model, tokenizer):
             setattr(model.config, token_attr, tokenizer_token)
 
     return model
+
+def _to_local(t):
+    """Convert DTensor to local tensor if needed."""
+    return t.to_local() if isinstance(t, DTensor) else t
 
 def setup_model(model=None, **kwargs):
     base_model_args = {
