@@ -71,8 +71,6 @@ def parallelize_full_model(model, tp_mesh):
     return model
 
 def wrap_fsdp2(model: torch.nn.Module, fsdp_mesh, tp_mesh) -> torch.nn.Module:
-    # Move model to GPU and disable HuggingFace cache
-    model = model.to(torch.device("cuda"))
     if hasattr(model, 'config'):
         try:
             model.config.use_cache = False
