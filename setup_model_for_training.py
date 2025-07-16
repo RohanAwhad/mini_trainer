@@ -84,7 +84,7 @@ def wrap_fsdp2(model: torch.nn.Module, fsdp_mesh, tp_mesh) -> torch.nn.Module:
         raise ValueError("Cannot find transformer block container on model")
 
     # Apply tensor parallelism to full model
-    model = parallelize_full_model(model, tp_mesh)
+    if tp_mesh.size(0) > 1: model = parallelize_full_model(model, tp_mesh)
     
     # Activation checkpoint each block
     for idx, block in enumerate(layers):

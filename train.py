@@ -95,21 +95,14 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
             mb_num_samples = mb.pop('num_samples')
             batch_num_loss_counted_tokens = mb.pop('batch_num_loss_counted_tokens')
             mb = {k: v.to(device) for k, v in mb.items()}
-            # torch.distributed.breakpoint()
-            output = model(**mb)
-            with loss_parallel():
+            with loss_parallel():  # this doesn't affect the model
+                output = model(**mb)
                 loss = output.loss.float().sum()
                 loss_metrics = loss.detach().item()
+                '''multiply by fsdp_size to account for the fact that fsdp takes the mean of the gradients across the fsdp_size'''
+                '''the loss is a sum of all cross entropy losses for all tokens in the batch, we divide by batch_num_loss_counted_tokens to get the average loss per token'''
                 loss = loss * fsdp_size / batch_num_loss_counted_tokens
-                loss.backward()  # ✅ inside context
-            # loss = output.loss.float().sum()
-            # loss_metrics = loss.detach().item()
-            # '''multiply by fsdp_size to account for the fact that fsdp takes the mean of the gradients across the fsdp_size'''
-            # '''the loss is a sum of all cross entropy losses for all tokens in the batch, we divide by batch_num_loss_counted_tokens to get the average loss per token'''
-            # loss = loss * fsdp_size / batch_num_loss_counted_tokens
-            #
-            # # TODO: fix this. it is not going to work as we are using loss_parallel
-            # loss.backward()
+                loss.backward()
             torch.cuda.empty_cache()
 
             batch_totals.accumulate_minibatch_metrics(
@@ -146,6 +139,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
                     "avg_time_per_minibatch": bm['time_per_minibatch']/(grad_accum+1)/fsdp_size,
                     "time_per_batch": batch_time,
                     "tokens_per_second": bm['num_total_tokens']/batch_time,
+                    "tokens_per_second_per_gpu": bm['num_total_tokens']/batch_time/fsdp_size,
                     "total_samples_accumulated": total_samples_accumulated,
                     "samples_per_second": bm['num_samples']/batch_time,
                     "peak_memory_usage_GB": float(torch.cuda.max_memory_allocated() / 1e9),
