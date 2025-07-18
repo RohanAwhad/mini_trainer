@@ -143,7 +143,6 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
                     "samples_per_second": bm['num_samples']/batch_time,
                     "peak_memory_usage_GB": float(torch.cuda.max_memory_allocated() / 1e9),
                 }
-
             metric_logger.log_sync(
                 batch_metrics
             )
@@ -203,7 +202,8 @@ def main(
             "min_samples_per_checkpoint": min_samples_per_checkpoint,
             "RANK": rank, # Include rank itself, though it will be 0 here
             "WORLD_SIZE": int(os.environ.get("WORLD_SIZE", 1)),
-            "tensor_parallel_size": tp_size,
+            "fsdp_size": fsdp_size,
+            "tp_size": tp_size,
         }
         params_path = output_path / f"training_params.json"
         with open(params_path, 'w') as f:
