@@ -204,7 +204,7 @@ def setup_training_components(model, fsdp_mesh, tp_mesh, **kwargs):
         lr=kwargs['learning_rate'],
         betas=(0.9, 0.95),
         weight_decay=0.0,
-        # TODO: fix this to be dynamic, or handle this gracefully so that user doesn't have to worry about it, and still get the optimized version.
+        # TODO: find how to get optimized version for tensor parallelism.
         foreach=False if tp_mesh.size(0) > 1 else None,
         fused=False if tp_mesh.size(0) > 1 else None,
     )
