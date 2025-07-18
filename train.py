@@ -167,7 +167,7 @@ def main(
     data_path: str = Option("test.jsonl", help="Path to the training data JSONL file"),
     batch_size: int = Option(1024, help="Initial batch size before dynamic splitting"),
     max_tokens_per_gpu: int = Option(10000, help="Maximum tokens per GPU per minibatch"),
-    tensor_parallel_size: int = Option(1, help="tensor parallelism group size"),
+    tensor_parallel_size: int = Option(1, help="tensor parallelism group size. set it to 1 to not use tensor parallel."),
     learning_rate: float = Option(5e-6, help="Peak learning rate"),
     num_warmup_steps: int = Option(10, help="Number of warmup steps for the LR scheduler"),
     lr_scheduler: str = Option("constant_with_warmup", help="Learning rate scheduler type"),
@@ -181,7 +181,8 @@ def main(
     ),
     min_samples_per_checkpoint: int = Option(..., help="Minimum number of samples processed before saving a checkpoint (required)"),
 ):
-    init_distributed_environment()
+    fsdp_mesh, tp_mesh = init_distributed_environment(tensor_parallel_size)
+    fsdp_size, tp_size = fsdp_mesh.size(0), tp_mesh.size(0)  # same as tensor_parallel_size
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -203,7 +204,7 @@ def main(
             "min_samples_per_checkpoint": min_samples_per_checkpoint,
             "RANK": rank, # Include rank itself, though it will be 0 here
             "WORLD_SIZE": int(os.environ.get("WORLD_SIZE", 1)),
-            "tensor_parallel_size": tensor_parallel_size,
+            "tensor_parallel_size": tp_size,
         }
         params_path = output_path / f"training_params.json"
         with open(params_path, 'w') as f:
@@ -214,20 +215,9 @@ def main(
 
     setup_logger(level=logging_level.value)
 
-    # Create device mesh for distributed training
-    from torch.distributed.device_mesh import init_device_mesh
-    import torch.distributed as dist
-    world_size = dist.get_world_size()
-    assert tensor_parallel_size >= 1 and tensor_parallel_size <= 8, f"expected tensor_parallel_size to be between [1, 8], but got '{tensor_parallel_size}'"
-    assert world_size % tensor_parallel_size == 0, f"expected world_size to be divisible by tensor parallel size, but got '{world_size} % {tensor_parallel_size} == {world_size % tensor_parallel_size}'"
-
-    fsdp_size = world_size // tensor_parallel_size
-    world_mesh = init_device_mesh("cuda", (fsdp_size, tensor_parallel_size), mesh_dim_names=("fsdp", "tp"))
-    fsdp_mesh, tp_mesh = world_mesh['fsdp'], world_mesh['tp']
-
     model = setup_model(model_name_or_path=model_name_or_path,
                         use_liger_kernels=use_liger_kernels,
-                        tp_size=tensor_parallel_size)
+                        tp_size=tp_size)
     model, optimizer, lr_scheduler = setup_training_components(model,
                                                                fsdp_mesh=fsdp_mesh,
                                                                tp_mesh=tp_mesh,
@@ -235,7 +225,7 @@ def main(
                                                                num_warmup_steps=num_warmup_steps,
                                                                lr_scheduler=lr_scheduler)
     data_loader = get_data_loader(fsdp_size=fsdp_size,
-                                  tp_size=tensor_parallel_size,
+                                  tp_size=tp_size,
                                   data_path=data_path,
                                   batch_size=batch_size,
                                   max_tokens_per_gpu=max_tokens_per_gpu,
@@ -249,7 +239,7 @@ def main(
           min_samples_per_checkpoint,
           model_name_or_path,
           fsdp_size,
-          tensor_parallel_size)
+          tp_size)
 
 
 if __name__ == "__main__":

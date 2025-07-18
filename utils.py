@@ -45,9 +45,20 @@ def patch_target_module(
     source = importlib.import_module(to_patch)
     setattr(source, obj_name_to_patch, replace_with)
 
-def init_distributed_environment():
+def init_distributed_environment(tp_size: int = 1):
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     torch.distributed.init_process_group("nccl", timeout=timedelta(minutes=180))
     tensor = torch.ByteTensor([False]).cuda()
     torch.distributed.all_reduce(tensor)
     torch.distributed.barrier()
+
+    # Create device mesh for distributed training
+    from torch.distributed.device_mesh import init_device_mesh
+    import torch.distributed as dist
+    world_size = dist.get_world_size()
+    assert tp_size >= 1 and tp_size <= 8, f"expected tp_size to be between [1, 8], but got '{tp_size}'"
+    assert world_size % tp_size == 0, f"expected world_size to be divisible by tensor parallel size, but got '{world_size} % {tp_size} == {world_size % tp_size}'"
+
+    fsdp_size = world_size // tp_size
+    world_mesh = init_device_mesh("cuda", (fsdp_size, tp_size), mesh_dim_names=("fsdp", "tp"))
+    return world_mesh['fsdp'], world_mesh['tp']
