@@ -11,6 +11,10 @@ MiniTrainer is a small form factor and extremely efficient training library for 
 - **pretrain and supervised** fine tuninng tokenization schemes
 - **`jsonl` logging**, your metrics will be logged in the output directory as a jsonl that can easily be processed for plotting, wandb or whatever you like for experiment tracking.
 
+### 🔥 What's New (July-17-2025) - Tensor Parallelism
+
+- **Native PyTorch based Tensor Parallelism**: Implemented tensor parallelism, enabling training for Qwen2.5-72B model size for 4096 sequence length. You can enable it by adding a new argument `--tensor-parallel-size 8`. Default is 1, which doesn't apply tensor parallelism. Max is 8. When tensor parallelism enabled, you cannot use liger kernels. It will raise a `ValueError`.
+
 ### 🔥 What's New (June-17-2025) - High-Performance Batch Packing
 
 - **Numba-Optimized LPT Batch Packing**: Implemented high-performance LPT (Longest Processing Time) algorithm with JIT compilation for optimal load balancing across GPUs. Achieves 3.5x better speed than greedy while providing up to 217% better load balance, 60-89% lower variance, and 33% fewer minibatches.
