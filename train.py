@@ -8,6 +8,7 @@ from typer import Typer, Option
 
 from async_structured_logger import AsyncStructuredLogger
 import torch
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import loss_parallel
 
 from batch_metrics import BatchMetrics
@@ -23,7 +24,7 @@ app = Typer(
 def take_gradient_step(model, optimizer, lr_scheduler):
     """Scales gradients, applies clipping, and takes an optimization step."""
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    grad_norm = grad_norm.full_tensor() # Convert DTensor to local while performing necessary all gathers and reduces.
+    if isinstance(grad_norm, DTensor): grad_norm = grad_norm.full_tensor() # Convert DTensor to local while performing necessary all gathers and reduces.
     optimizer.step()
     lr_scheduler.step()
     optimizer.zero_grad()
