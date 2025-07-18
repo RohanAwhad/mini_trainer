@@ -48,7 +48,7 @@ def create_tensor_parallel_plan() -> dict:
     }
 
 
-def parallelize_full_model(model, tp_mesh):
+def tensor_parallelize_full_model(model, tp_mesh):
     """Parallelize the entire model including embeddings and output layers."""
     # raise warning if model is not one of Qwen3, Qwen2 and Llama
     if model.__class__.__name__ not in ["Qwen3ForCausalLM", "Qwen2ForCausalLM", "LlamaForCausalLM"]:
@@ -70,7 +70,7 @@ def parallelize_full_model(model, tp_mesh):
     parallelize_module(module=model, device_mesh=tp_mesh, parallelize_plan=model_tp_plan)
     return model
 
-def wrap_fsdp2(model: torch.nn.Module, fsdp_mesh, tp_mesh) -> torch.nn.Module:
+def wrap_fsdp2(model: torch.nn.Module, fsdp_mesh) -> torch.nn.Module:
     if hasattr(model, 'config'):
         try:
             model.config.use_cache = False
@@ -82,9 +82,6 @@ def wrap_fsdp2(model: torch.nn.Module, fsdp_mesh, tp_mesh) -> torch.nn.Module:
         layers = model.model.layers
     else:
         raise ValueError("Cannot find transformer block container on model")
-
-    # Apply tensor parallelism to full model
-    if tp_mesh.size(0) > 1: model = parallelize_full_model(model, tp_mesh)
     
     # Activation checkpoint each block
     for idx, block in enumerate(layers):
@@ -142,10 +139,6 @@ def align_model_and_tokenizer(model, tokenizer):
 
     return model
 
-def _to_local(t):
-    """Convert DTensor to local tensor if needed."""
-    return t.to_local() if isinstance(t, DTensor) else t
-
 def setup_model(model=None, **kwargs):
     base_model_args = {
         "pretrained_model_name_or_path": kwargs['model_name_or_path'],
@@ -198,9 +191,13 @@ def setup_model(model=None, **kwargs):
 def setup_training_components(model, fsdp_mesh, tp_mesh, **kwargs):
     from transformers import get_scheduler
     
+    # Apply tensor parallelism to full model
+    log_rank_0("Using Tensor Parallelism wrapper")
+    if tp_mesh.size(0) > 1: model = tensor_parallelize_full_model(model, tp_mesh)
+
     # Using FSDP2 wrapper
     log_rank_0("Using FSDP2 wrapper")
-    model = wrap_fsdp2(model, fsdp_mesh, tp_mesh)
+    model = wrap_fsdp2(model, fsdp_mesh)
     
     optimizer = torch.optim.AdamW(
         model.parameters(),
