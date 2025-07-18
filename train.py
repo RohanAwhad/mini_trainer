@@ -127,7 +127,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
             batch_metrics = {
                     "step": step,
                     "lr": lr_scheduler.get_last_lr()[0],
-                    "grad_norm": grad_norm,
+                    "grad_norm": grad_norm.item(),
                     "loss": bm['loss']/batch_num_loss_counted_tokens,
                     "avg_loss_backward": bm['loss_backward']/(grad_accum+1),
                     "num_samples": bm['num_samples'],
